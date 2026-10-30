@@ -32,7 +32,8 @@ in_scope() {
   fi
 }
 
-# restore_<backend> <name> <cwd> <command>: returns 1 if already open.
+# restore_<backend> <name> <cwd> <command> <cmux terminal> <cmux workspace>:
+# returns 1 if already open.
 restore_tmux() {
   # tmux forbids '.' and ':' in session names.
   local sess="cc-${1//[.:]/-}"
@@ -48,10 +49,19 @@ restore_tmux() {
 }
 
 restore_cmux() {
-  local term
-  cmux --json workspace list | jq -e --arg n "$1" 'any(.[]; .name == $n)' >/dev/null && return 1
-  term=$(cmux --json workspace create --name "$1" | jq -r .value.terminal_id)
-  # Same as tmux: typed into the workspace's interactive shell.
+  local name=$1 term ws=$5 idx
+  if [[ -n $ws ]] && idx=$(cmux --json workspace list | jq -e --arg w "$ws" 'map(select(.id == $w))[0].index'); then
+    # cmux brings the workspace back after a reboot, with a dead terminal.
+    [[ $(cmux --json terminal "$4" show 2>/dev/null | jq -r .lifecycle) == running ]] && return 1
+    name=$(cmux --json workspace "$ws" show | jq -r .name)
+    cmux --quiet workspace "$ws" close
+  elif cmux --json workspace list | jq -e --arg n "$name" 'any(.[]; .name == $n)' >/dev/null; then
+    return 1
+  fi
+  read -r ws term < <(cmux --json workspace create --name "$name" | jq -r '.value | "\(.workspace_id) \(.terminal_id)"')
+  [[ -n ${idx:-} ]] && cmux --quiet workspace "$ws" move --index "$idx"
+  # Same as tmux: typed into the workspace's interactive shell, once it runs.
+  cmux --quiet terminal "$term" screen wait --pattern . --timeout-ms 5000 || true
   cmux --quiet terminal "$term" write --text "cd $(printf %q "$2") && $3"$'\n'
 }
 
@@ -64,12 +74,12 @@ case $backend in
 esac
 
 n=0
-while IFS=$'\t' read -r id cwd name skip; do
+while IFS=$'\t' read -r id cwd name skip term ws; do
   [[ -d $cwd ]] || continue
   flags=""; [[ $skip == true ]] && flags=" --dangerously-skip-permissions"
-  "restore_$backend" "$name" "$cwd" "claude$flags --resume $id" || continue
+  "restore_$backend" "$name" "$cwd" "claude$flags --resume $id" "$term" "$ws" || continue
   n=$((n + 1))
-done < <(jq -r '.sessions[] | [.sessionId, .cwd, .name, (.skip | tostring)] | @tsv' "$snap")
+done < <(jq -r '.sessions[] | [.sessionId, .cwd, .name, (.skip | tostring), (.term // ""), (.workspace // "")] | @tsv' "$snap")
 
 mv "$snap" "$state/last-restored.json"
 if ((n > 0)); then

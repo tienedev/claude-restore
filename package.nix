@@ -1,4 +1,4 @@
-{ lib, symlinkJoin, writeShellApplication, jq, coreutils, gnugrep, tmux, libnotify
+{ lib, symlinkJoin, writeShellApplication, jq, coreutils, gnugrep, gnused, tmux, libnotify
 , backend ? "tmux", cmux ? null }:
 assert lib.assertOneOf "backend" backend [ "tmux" "cmux" ];
 assert backend == "cmux" -> cmux != null;
@@ -13,7 +13,9 @@ in
 symlinkJoin {
   name = "claude-restore";
   paths = [
-    (mk "claude-sessions-save" ./save.sh [ jq coreutils gnugrep ] { })
+    (mk "claude-sessions-save" ./save.sh ([ jq coreutils gnugrep gnused ] ++ lib.optional (backend == "cmux") cmux) {
+      runtimeEnv.CLAUDE_RESTORE_BACKEND = backend;
+    })
     (mk "claude-restore" ./restore.sh [ jq coreutils mux libnotify ] {
       runtimeEnv.CLAUDE_RESTORE_BACKEND = backend;
     })
