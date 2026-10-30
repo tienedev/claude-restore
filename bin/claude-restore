@@ -31,6 +31,28 @@ boot_id() {
   fi
 }
 
+# Boot time, in seconds since the epoch.
+boot_time() {
+  if [[ -r /proc/stat ]]; then
+    sed -n 's/^btime //p' /proc/stat
+  else
+    sysctl -n kern.boottime | sed 's/^{ sec = \([0-9]*\).*/\1/'
+  fi
+}
+
+# Ids of the Claude sessions running right now, from Claude's own registry.
+# Files of a previous boot are skipped: their pid may belong to anything now.
+live_sessions() {
+  local dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions" since f pid
+  since=$(boot_time)
+  for f in "$dir"/*.json; do
+    [[ -f $f ]] || continue
+    pid=$(jq -r --argjson since "$since" 'select((.startedAt // 0) / 1000 >= $since) | .pid' "$f" 2>/dev/null)
+    { [[ -n $pid ]] && kill -0 "$pid" 2>/dev/null; } || continue
+    [[ $(ps -o command= -p "$pid" 2>/dev/null) == *claude* ]] && jq -r .sessionId "$f"
+  done
+}
+
 # write_record <id> <json>: atomic, so a concurrent reader never sees half a file.
 write_record() {
   local tmp
@@ -86,6 +108,9 @@ mode_from_args() {
     *" --permission-mode "*)
       mode=${args#* --permission-mode }
       mode=${mode%% *} ;;
+    *" --permission-mode="*)
+      mode=${args#* --permission-mode=}
+      mode=${mode%% *} ;;
   esac
   echo "$mode"
 }
@@ -112,6 +137,8 @@ cmd_hook() {
   f="$records/$id.json"
   case $(jq -r .hook_event_name <<<"$input") in
     SessionStart)
+      # Interactive terminal sessions only, not `claude -p`, the SDK or IDEs.
+      [[ ${CLAUDE_CODE_ENTRYPOINT:-cli} == cli ]] || return 0
       record "$id" "$(jq -r '.cwd // empty' <<<"$input")" \
         "$(mode_from_args "$(claude_cmdline)" "$(jq -r '.permission_mode // "default"' <<<"$input")")" \
         "$(jq -r '.session_title // empty' <<<"$input")" ;;
@@ -120,8 +147,14 @@ cmd_hook() {
       case $(jq -r '.reason // "other"' <<<"$input") in
         # Closed on purpose: forget it.
         clear|resume|logout|prompt_input_exit) rm -f "$f" ;;
-        # Killed (terminal closed, shutdown...): keep it, restore decides.
-        *) write_record "$id" "$(jq --argjson now "$(date +%s)" '.endedAt = $now' "$f")" ;;
+        *)
+          # Killed. While the system keeps running, it is a terminal being
+          # closed: forget it. During a shutdown (or when we can't tell),
+          # keep it and let restore decide.
+          case $(systemctl is-system-running 2>/dev/null) in
+            running|degraded|maintenance) rm -f "$f" ;;
+            *) write_record "$id" "$(jq --argjson now "$(date +%s)" '.endedAt = $now' "$f")" ;;
+          esac ;;
       esac ;;
   esac
 }
@@ -141,8 +174,8 @@ cmd_adopt() {
       env=$(tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null) || env=""
     else
       args=$(ps -o command= -p "$pid") || continue
-      # macOS prints the environment after the arguments with `ps e`.
-      env=$(ps eww -o command= -p "$pid" | tr ' ' '\n') || env=""
+      # macOS: -E appends the environment to the command line.
+      env=$(ps -wwE -o command= -p "$pid" | tr ' ' '\n') || env=""
     fi
     [[ $args == *claude* ]] || continue
     (
@@ -178,12 +211,14 @@ in_scope() {
   fi
 }
 
-# restore_<mux> <name> <cwd> <command> <record>: returns 1 if already open,
-# 2 if it could not be reopened.
+# restore_<mux> <name> <cwd> <command> <record>: non-zero if it could not be
+# reopened.
 restore_tmux() {
   # tmux forbids '.' and ':' in session names.
-  local sess="cc-${1//[.:]/-}"
-  tmux has-session -t "=$sess" 2>/dev/null && return 1
+  local sess="cc-${1//[.:]/-}" i=2
+  while tmux has-session -t "=$sess" 2>/dev/null; do
+    sess="cc-${1//[.:]/-}-$i" i=$((i + 1))
+  done
   if tmux info >/dev/null 2>&1; then
     tmux new-session -d -s "$sess" -c "$2" || return 2
   else
@@ -194,19 +229,29 @@ restore_tmux() {
   tmux send-keys -t "=$sess:" "$3" Enter || return 2
 }
 
+# unique_name <name> <existing names, one per line>: name, or name-2, name-3...
+unique_name() {
+  local name=$1 i=2
+  while grep -qxF -- "$name" <<<"$2"; do
+    name="$1-$i" i=$((i + 1))
+  done
+  echo "$name"
+}
+
 restore_cmux() {
   local name=$1 ws term idx=""
   new_ws="" new_term=""
   cmux server status >/dev/null 2>&1 || in_scope cmux --quiet server ensure || return 2
   ws=$(jq -r '.cmuxWorkspace // ""' "$4") term=$(jq -r '.cmuxTerminal // ""' "$4")
   [[ -n $ws ]] && idx=$(cmux --json workspace list | jq -r --arg w "$ws" 'map(select(.id == $w))[0].index // empty')
-  if [[ -n $idx ]]; then
-    # cmux brings the workspace back after a reboot, with a dead terminal.
-    [[ $(cmux --json terminal "$term" show 2>/dev/null | jq -r .lifecycle) == running ]] && return 1
+  # cmux brings the workspace back after a reboot, with a dead terminal:
+  # replace it in place. If its terminal still runs something, leave it be.
+  if [[ -n $idx && $(cmux --json terminal "$term" show 2>/dev/null | jq -r .lifecycle) != running ]]; then
     name=$(cmux --json workspace "$ws" show | jq -r .name)
     cmux --quiet workspace "$ws" close
-  elif cmux --json workspace list | jq -e --arg n "$name" 'any(.[]; .name == $n)' >/dev/null; then
-    return 1
+  else
+    idx=""
+    name=$(unique_name "$name" "$(cmux --json workspace list | jq -r '.[].name')")
   fi
   read -r ws term < <(cmux --json workspace create --name "$name" | jq -r '.value | "\(.workspace_id) \(.terminal_id)"')
   [[ -n $term ]] || return 2
@@ -236,7 +281,7 @@ notify() {
 # `claude-restore restore [--force] [--dry-run]`: reopen the sessions of the
 # previous boot (or of any boot, with --force).
 cmd_restore() {
-  local force=false dry=false boot f id cwd mux name n=0 failed=0 last rc
+  local force=false dry=false boot f id cwd mux name n=0 failed=0 last live
   while (($#)); do
     case $1 in
       -f|--force) force=true ;;
@@ -246,10 +291,17 @@ cmd_restore() {
     shift
   done
   [[ -d $records ]] || { echo "Nothing to restore."; return 0; }
-  # Only one restore at a time (login service and hook may race).
-  mkdir "$state_dir/.lock" 2>/dev/null || { echo "A restore is already running."; return 0; }
-  trap 'rmdir "$state_dir/.lock"' EXIT
+  # Only one restore at a time (login service and hook may race). A lock
+  # left by a restore that was killed is taken over.
+  if ! mkdir "$state_dir/.lock" 2>/dev/null; then
+    kill -0 "$(cat "$state_dir/.lock/pid" 2>/dev/null)" 2>/dev/null && { echo "A restore is already running."; return 0; }
+    rm -rf "$state_dir/.lock"
+    mkdir "$state_dir/.lock"
+  fi
+  echo $$ >"$state_dir/.lock/pid"
+  trap 'rm -rf "$state_dir/.lock"' EXIT
   boot=$(boot_id)
+  live=$(live_sessions)
   for f in "$records"/*.json; do
     [[ -f $f ]] || continue
     if [[ $(jq -r .boot "$f") == "$boot" ]] && ! $force; then continue; fi
@@ -259,7 +311,7 @@ cmd_restore() {
       $dry || rm -f "$f"
       continue
     fi
-    id=$(jq -r .sessionId "$f") cwd=$(jq -r .cwd "$f")
+    id=$(jq -r .sessionId "$f") cwd=$(jq -r .cwd "$f") new_ws="" new_term=""
     [[ -d $cwd ]] || { $dry || rm -f "$f"; continue; }
     mux=$(jq -r '.mux // "none"' "$f")
     [[ $mux != none ]] && have "$mux" || mux=$(default_mux)
@@ -267,18 +319,20 @@ cmd_restore() {
       if (.title // "") != "" then .title
       elif (.tmuxSession // "") | startswith("cc-") then .tmuxSession[3:]
       else "\($d)-\(.sessionId[0:4])" end' "$f")
-    if $dry; then
+    if grep -qxF -- "$id" <<<"$live"; then
+      $dry && printf 'running\t%s\t%s\n' "$name" "$cwd"
+    elif $dry; then
       printf '%s\t%s\t%s\n' "$mux" "$name" "$cwd"
       continue
+    elif "restore_$mux" "$name" "$cwd" "${CLAUDE_RESTORE_CLAUDE:-claude}$(mode_flags "$(jq -r .permissionMode "$f")") --resume $id" "$f"; then
+      n=$((n + 1))
+    else
+      echo "Could not reopen $name in $mux, kept for the next restore." >&2
+      failed=$((failed + 1))
+      continue
     fi
-    rc=0
-    "restore_$mux" "$name" "$cwd" "${CLAUDE_RESTORE_CLAUDE:-claude}$(mode_flags "$(jq -r .permissionMode "$f")") --resume $id" "$f" || rc=$?
-    case $rc in
-      0) n=$((n + 1)) ;;
-      1) ;;
-      *) echo "Could not reopen $name in $mux, kept for the next restore." >&2; failed=$((failed + 1)); continue ;;
-    esac
-    # Restored (or already open): it belongs to this boot now.
+    $dry && continue
+    # Restored (or already running): it belongs to this boot now.
     write_record "$id" "$(jq --arg b "$boot" --arg ws "${new_ws:-}" --arg term "${new_term:-}" '
       .boot = $b | del(.endedAt)
       | if $ws != "" then .cmuxWorkspace = $ws | .cmuxTerminal = $term else . end' "$f")"
