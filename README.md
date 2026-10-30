@@ -2,21 +2,20 @@
 
 Reopen your [Claude Code](https://claude.com/claude-code) sessions after a reboot.
 
-- **Save**: a systemd user timer (every minute) reads `~/.claude/sessions/<pid>.json`,
-  keeps the sessions whose process is alive and writes
-  `~/.local/state/claude-restore/sessions.json`.
-- **Restore**: at login, each session of the previous boot is reopened with
-  `claude --resume <id>` in its original directory (`--dangerously-skip-permissions`
-  is kept if it was set), either in a detached tmux session `cc-<name>` (attach with
-  `prefix + s`) or in a [cmux](https://github.com/manaflow-ai/cmux) workspace named
-  after the session.
+- **Record**: `SessionStart`/`SessionEnd` hooks record every interactive session:
+  its id, directory, permission mode, and the tmux session or
+  [cmux](https://github.com/manaflow-ai/cmux) workspace it runs in.
+- **Restore**: after a reboot, each session of the previous boot is reopened with
+  `claude --resume <id>` in its original directory and permission mode, back in
+  tmux (`cc-<name>` sessions) or in its own cmux workspace.
 
-The snapshot is tagged with the boot id, so the timer never overwrites a snapshot
-that hasn't been restored yet. At most one interval of changes is lost.
+Sessions you leave on purpose (`/exit`, `/clear`, `/resume`, logout) are
+forgotten. Sessions killed by the shutdown are restored; one you closed by
+killing its terminal well before shutting down is not.
 
-Linux + systemd, with tmux or cmux.
+Linux and macOS, bash ≥ 3.2, needs `jq` and tmux or cmux.
 
-## Usage
+## Nix (home-manager)
 
 ```nix
 # flake.nix
@@ -30,18 +29,22 @@ imports = [ inputs.claude-restore.homeManagerModules.default ];
 programs.claude-restore.enable = true;
 ```
 
+The hooks are added to `programs.claude-code.settings` automatically. If you
+manage Claude Code settings another way, merge
+`config.programs.claude-restore.claudeHooks` into your `settings.hooks`.
+
 | Option | Default | |
 |---|---|---|
-| `backend` | `"tmux"` | `"tmux"` or `"cmux"` |
-| `cmuxPackage` | `null` | cmux package, required with `backend = "cmux"` |
-| `interval` | `"1min"` | snapshot period |
-| `restoreOnLogin` | `true` | restore automatically |
-| `target` | `"graphical-session.target"` | use `"default.target"` on a headless box |
+| `backend` | `null` | `"tmux"` or `"cmux"` for sessions started outside both (`null`: tmux if installed) |
+| `cmuxPackage` | `null` | cmux package, to restore into cmux |
+| `restoreOnLogin` | `true` | restore at login (systemd user service / launchd agent) |
+| `target` | `"graphical-session.target"` | Linux: use `"default.target"` on a headless box |
 
 ## Commands
 
 ```
-claude-restore --list    # show the snapshot
-claude-restore --force   # restore even if the snapshot is from the current boot
-claude-sessions-save     # snapshot now
+claude-restore list                 recorded sessions and their state
+claude-restore restore [--force]    reopen the previous boot's sessions
+                       [--dry-run]  show what would be reopened
+claude-restore adopt                record sessions already running (after install)
 ```

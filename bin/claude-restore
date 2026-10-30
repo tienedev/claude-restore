@@ -1,0 +1,332 @@
+#!/usr/bin/env bash
+# claude-restore: reopen your Claude Code sessions after a reboot.
+#
+# Claude Code hooks record every interactive session (id, directory, permission
+# mode, and the tmux/cmux terminal it runs in). After a reboot, `restore`
+# reopens each one with `claude --resume <id>` in tmux or cmux.
+#
+# Portable: Linux and macOS, bash >= 3.2, needs jq.
+set -euo pipefail
+
+VERSION=0.2.0
+state_dir="${CLAUDE_RESTORE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/claude-restore}"
+records="$state_dir/sessions"
+# Sessions that end this long before the last one of their boot were closed
+# on purpose, not killed by the shutdown.
+shutdown_window="${CLAUDE_RESTORE_SHUTDOWN_WINDOW:-90}"
+
+die() { echo "claude-restore: $*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+have jq || die "jq is required (https://jqlang.org/download/)"
+
+# Changes on every boot. Linux: kernel boot id. macOS/BSD: boot time.
+boot_id() {
+  if [[ -r /proc/sys/kernel/random/boot_id ]]; then
+    cat /proc/sys/kernel/random/boot_id
+  elif have sysctl; then
+    sysctl -n kern.boottime | sed 's/^{ sec = \([0-9]*\), usec = \([0-9]*\).*/\1.\2/'
+  else
+    die "cannot tell the boot id on this system"
+  fi
+}
+
+# write_record <id> <json>: atomic, so a concurrent reader never sees half a file.
+write_record() {
+  local tmp
+  mkdir -p "$records"
+  tmp=$(mktemp "$records/.$1.XXXXXX")
+  printf '%s\n' "$2" >"$tmp"
+  mv "$tmp" "$records/$1.json"
+}
+
+# Workspace of a cmux terminal: terminal -> tab -> pane -> screen -> workspace.
+cmux_workspace_of() {
+  jq -nr --arg term "$1" \
+    --argjson t "$(cmux --json tab list)" \
+    --argjson p "$(cmux --json pane list)" \
+    --argjson s "$(cmux --json screen list)" '
+      (($p | map({(.id): .screen_id}) | add) // {}) as $P
+      | (($s | map({(.id): .workspace_id}) | add) // {}) as $S
+      | first($t[] | select(.content_id == $term) | $S[$P[.pane_id]]) // ""'
+}
+
+# Where the current process runs: sets mux, term, workspace, tmux_session.
+detect_mux() {
+  mux=none term="" workspace="" tmux_session=""
+  if [[ -n ${CMUX_TUI_TERMINAL_ID:-} ]] && have cmux; then
+    mux=cmux term=$CMUX_TUI_TERMINAL_ID
+    workspace=$(cmux_workspace_of "$term" 2>/dev/null) || workspace=""
+  elif [[ -n ${TMUX:-} ]] && have tmux; then
+    mux=tmux
+    tmux_session=$(tmux display-message -p -t "${TMUX_PANE:-}" '#S' 2>/dev/null) || tmux_session=""
+  fi
+}
+
+# Command line of the claude process running this hook: the nearest ancestor
+# that is claude itself (not this script, nor the shell around the hook).
+claude_cmdline() {
+  local pid=$PPID cmd _
+  for _ in 1 2 3 4 5 6; do
+    [[ -n $pid && $pid -gt 1 ]] || return 0
+    cmd=$(ps -o command= -p "$pid" 2>/dev/null) || return 0
+    case $cmd in
+      *claude-restore*) ;;
+      *claude*) echo "$cmd"; return 0 ;;
+    esac
+    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ') || return 0
+  done
+}
+
+# Permission mode from claude's arguments; hooks don't reliably report it.
+mode_from_args() {
+  local args=" $1 " mode=${2:-default}
+  case $args in
+    *" --dangerously-skip-permissions "*) mode=bypassPermissions ;;
+    *" --permission-mode "*)
+      mode=${args#* --permission-mode }
+      mode=${mode%% *} ;;
+  esac
+  echo "$mode"
+}
+
+# record <id> <cwd> <permission mode> <title>, from the current environment.
+record() {
+  detect_mux
+  write_record "$1" "$(jq -n --arg id "$1" --arg cwd "$2" --arg mode "$3" --arg title "$4" \
+    --arg boot "$(boot_id)" --argjson now "$(date +%s)" --arg mux "$mux" --arg term "$term" \
+    --arg workspace "$workspace" --arg tmux "$tmux_session" '{
+      sessionId: $id, cwd: $cwd, permissionMode: $mode, title: $title, boot: $boot,
+      startedAt: $now, mux: $mux, cmuxTerminal: $term, cmuxWorkspace: $workspace,
+      tmuxSession: $tmux}')"
+}
+
+# `claude-restore hook`: called by the SessionStart and SessionEnd hooks with
+# the hook payload on stdin. Never fails, so it can't get in Claude's way.
+cmd_hook() {
+  local input id f
+  input=$(cat)
+  jq -e 'type == "object"' >/dev/null 2>&1 <<<"$input" || return 0
+  id=$(jq -r '.session_id // empty' <<<"$input")
+  [[ -n $id ]] || return 0
+  f="$records/$id.json"
+  case $(jq -r .hook_event_name <<<"$input") in
+    SessionStart)
+      record "$id" "$(jq -r '.cwd // empty' <<<"$input")" \
+        "$(mode_from_args "$(claude_cmdline)" "$(jq -r '.permission_mode // "default"' <<<"$input")")" \
+        "$(jq -r '.session_title // empty' <<<"$input")" ;;
+    SessionEnd)
+      [[ -f $f ]] || return 0
+      case $(jq -r '.reason // "other"' <<<"$input") in
+        # Closed on purpose: forget it.
+        clear|resume|logout|prompt_input_exit) rm -f "$f" ;;
+        # Killed (terminal closed, shutdown...): keep it, restore decides.
+        *) write_record "$id" "$(jq --argjson now "$(date +%s)" '.endedAt = $now' "$f")" ;;
+      esac ;;
+  esac
+}
+
+# `claude-restore adopt`: record the sessions already running, e.g. right after
+# installing, since hooks only see sessions started from then on.
+cmd_adopt() {
+  local dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions" f pid id cwd args env n=0
+  for f in "$dir"/*.json; do
+    [[ -f $f ]] || continue
+    [[ $(jq -r '.kind // "interactive"' "$f") == interactive ]] || continue
+    pid=$(jq -r .pid "$f") id=$(jq -r .sessionId "$f") cwd=$(jq -r .cwd "$f")
+    kill -0 "$pid" 2>/dev/null || continue
+    [[ -f $records/$id.json ]] && continue
+    if [[ -r /proc/$pid/cmdline ]]; then
+      args=$(tr '\0' ' ' <"/proc/$pid/cmdline")
+      env=$(tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null) || env=""
+    else
+      args=$(ps -o command= -p "$pid") || continue
+      # macOS prints the environment after the arguments with `ps e`.
+      env=$(ps eww -o command= -p "$pid" | tr ' ' '\n') || env=""
+    fi
+    [[ $args == *claude* ]] || continue
+    (
+      # Run detection with the session's terminal environment.
+      unset CMUX_TUI_TERMINAL_ID TMUX TMUX_PANE
+      while IFS='=' read -r k v; do
+        case $k in CMUX_TUI_TERMINAL_ID|TMUX|TMUX_PANE) export "$k=$v" ;; esac
+      done <<<"$env"
+      record "$id" "$cwd" "$(mode_from_args "$args")" "$(jq -r '.name // ""' "$f")"
+    )
+    n=$((n + 1))
+  done
+  echo "$n running session(s) adopted."
+}
+
+# claude flags reproducing the recorded permission mode.
+mode_flags() {
+  case $1 in
+    bypassPermissions) echo " --dangerously-skip-permissions" ;;
+    acceptEdits|plan|auto) echo " --permission-mode $1" ;;
+  esac
+}
+
+# Start a tmux/cmux server. From a systemd service it would die with the
+# service's cgroup: give it its own scope. Its shells must not inherit our
+# settings either.
+in_scope() {
+  set -- env -u CLAUDE_RESTORE_BACKEND -u CLAUDE_RESTORE_CLAUDE -u CLAUDE_RESTORE_STATE_DIR "$@"
+  if [[ -n ${XDG_RUNTIME_DIR:-} ]] && have systemd-run; then
+    systemd-run --user --scope --quiet --collect -- "$@"
+  else
+    "$@"
+  fi
+}
+
+# restore_<mux> <name> <cwd> <command> <record>: returns 1 if already open,
+# 2 if it could not be reopened.
+restore_tmux() {
+  # tmux forbids '.' and ':' in session names.
+  local sess="cc-${1//[.:]/-}"
+  tmux has-session -t "=$sess" 2>/dev/null && return 1
+  if tmux info >/dev/null 2>&1; then
+    tmux new-session -d -s "$sess" -c "$2" || return 2
+  else
+    in_scope tmux new-session -d -s "$sess" -c "$2" || return 2
+  fi
+  # Typed into the interactive shell: user env/aliases apply, and the shell
+  # stays open once claude exits.
+  tmux send-keys -t "=$sess:" "$3" Enter || return 2
+}
+
+restore_cmux() {
+  local name=$1 ws term idx=""
+  new_ws="" new_term=""
+  cmux server status >/dev/null 2>&1 || in_scope cmux --quiet server ensure || return 2
+  ws=$(jq -r '.cmuxWorkspace // ""' "$4") term=$(jq -r '.cmuxTerminal // ""' "$4")
+  [[ -n $ws ]] && idx=$(cmux --json workspace list | jq -r --arg w "$ws" 'map(select(.id == $w))[0].index // empty')
+  if [[ -n $idx ]]; then
+    # cmux brings the workspace back after a reboot, with a dead terminal.
+    [[ $(cmux --json terminal "$term" show 2>/dev/null | jq -r .lifecycle) == running ]] && return 1
+    name=$(cmux --json workspace "$ws" show | jq -r .name)
+    cmux --quiet workspace "$ws" close
+  elif cmux --json workspace list | jq -e --arg n "$name" 'any(.[]; .name == $n)' >/dev/null; then
+    return 1
+  fi
+  read -r ws term < <(cmux --json workspace create --name "$name" | jq -r '.value | "\(.workspace_id) \(.terminal_id)"')
+  [[ -n $term ]] || return 2
+  new_ws=$ws new_term=$term
+  [[ -n $idx ]] && cmux --quiet workspace "$ws" move --index "$idx"
+  # Same as tmux: typed into the workspace's interactive shell, once it runs.
+  cmux --quiet terminal "$term" screen wait --pattern . --timeout-ms 5000 || true
+  cmux --quiet terminal "$term" write --text "cd $(printf %q "$2") && $3"$'\n' || return 2
+}
+
+default_mux() {
+  if [[ -n ${CLAUDE_RESTORE_BACKEND:-} ]]; then echo "$CLAUDE_RESTORE_BACKEND"
+  elif have tmux; then echo tmux
+  elif have cmux; then echo cmux
+  else die "neither tmux nor cmux found: install one, or set CLAUDE_RESTORE_BACKEND"
+  fi
+}
+
+notify() {
+  if have notify-send; then
+    notify-send -a claude-restore "$1" "$2" 2>/dev/null || true
+  elif have osascript; then
+    osascript -e "display notification \"$2\" with title \"$1\"" >/dev/null 2>&1 || true
+  fi
+}
+
+# `claude-restore restore [--force] [--dry-run]`: reopen the sessions of the
+# previous boot (or of any boot, with --force).
+cmd_restore() {
+  local force=false dry=false boot f id cwd mux name n=0 failed=0 last rc
+  while (($#)); do
+    case $1 in
+      -f|--force) force=true ;;
+      -n|--dry-run) dry=true ;;
+      *) die "restore: unknown option $1" ;;
+    esac
+    shift
+  done
+  [[ -d $records ]] || { echo "Nothing to restore."; return 0; }
+  # Only one restore at a time (login service and hook may race).
+  mkdir "$state_dir/.lock" 2>/dev/null || { echo "A restore is already running."; return 0; }
+  trap 'rmdir "$state_dir/.lock"' EXIT
+  boot=$(boot_id)
+  for f in "$records"/*.json; do
+    [[ -f $f ]] || continue
+    if [[ $(jq -r .boot "$f") == "$boot" ]] && ! $force; then continue; fi
+    # Ended well before the last session of its boot: closed on purpose.
+    last=$(jq -s --arg b "$(jq -r .boot "$f")" 'map(select(.boot == $b) | .endedAt // empty) | max // 0' "$records"/*.json)
+    if [[ $(jq --argjson last "$last" --argjson w "$shutdown_window" '(.endedAt // $last) < $last - $w' "$f") == true ]]; then
+      $dry || rm -f "$f"
+      continue
+    fi
+    id=$(jq -r .sessionId "$f") cwd=$(jq -r .cwd "$f")
+    [[ -d $cwd ]] || { $dry || rm -f "$f"; continue; }
+    mux=$(jq -r '.mux // "none"' "$f")
+    [[ $mux != none ]] && have "$mux" || mux=$(default_mux)
+    name=$(jq -r --arg d "${cwd##*/}" '
+      if (.title // "") != "" then .title
+      elif (.tmuxSession // "") | startswith("cc-") then .tmuxSession[3:]
+      else "\($d)-\(.sessionId[0:4])" end' "$f")
+    if $dry; then
+      printf '%s\t%s\t%s\n' "$mux" "$name" "$cwd"
+      continue
+    fi
+    rc=0
+    "restore_$mux" "$name" "$cwd" "${CLAUDE_RESTORE_CLAUDE:-claude}$(mode_flags "$(jq -r .permissionMode "$f")") --resume $id" "$f" || rc=$?
+    case $rc in
+      0) n=$((n + 1)) ;;
+      1) ;;
+      *) echo "Could not reopen $name in $mux, kept for the next restore." >&2; failed=$((failed + 1)); continue ;;
+    esac
+    # Restored (or already open): it belongs to this boot now.
+    write_record "$id" "$(jq --arg b "$boot" --arg ws "${new_ws:-}" --arg term "${new_term:-}" '
+      .boot = $b | del(.endedAt)
+      | if $ws != "" then .cmuxWorkspace = $ws | .cmuxTerminal = $term else . end' "$f")"
+  done
+  if ((n > 0)); then
+    notify "$n Claude session(s) restored" "claude-restore list"
+  fi
+  $dry || echo "$n session(s) restored."
+  ((failed == 0))
+}
+
+# `claude-restore list`: the recorded sessions and what restore would do.
+cmd_list() {
+  local boot
+  [[ -d $records ]] || { echo "No session recorded yet."; return 0; }
+  boot=$(boot_id)
+  jq -rs --arg boot "$boot" '
+    sort_by(.startedAt)[]
+    | [ (if .boot != $boot then "to restore" elif .endedAt then "ended" else "running" end),
+        .mux, (if .title != "" then .title else .sessionId[0:8] end), .cwd ]
+    | @tsv' "$records"/*.json 2>/dev/null | column -t -s $'\t' || true
+}
+
+usage() {
+  cat <<EOF
+claude-restore $VERSION: reopen your Claude Code sessions after a reboot.
+
+Usage:
+  claude-restore list                 recorded sessions and their state
+  claude-restore restore [--force]    reopen the previous boot's sessions
+                         [--dry-run]  show what would be reopened
+  claude-restore adopt                record sessions already running
+  claude-restore hook                 (internal) SessionStart/SessionEnd hook
+
+Environment:
+  CLAUDE_RESTORE_BACKEND   tmux or cmux, for sessions not started in either
+  CLAUDE_RESTORE_CLAUDE    command used to resume (default: claude)
+  CLAUDE_RESTORE_STATE_DIR state directory (default: ~/.local/state/claude-restore)
+EOF
+}
+
+case "${1:-}" in
+  hook) cmd_hook || true ;;
+  restore) shift; cmd_restore "$@" ;;
+  list|ls) cmd_list ;;
+  adopt) cmd_adopt ;;
+  -h|--help|help) usage ;;
+  -V|--version) echo "claude-restore $VERSION" ;;
+  "") usage; exit 1 ;;
+  *) die "unknown command $1 (see --help)" ;;
+esac

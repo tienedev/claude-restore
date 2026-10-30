@@ -1,11 +1,11 @@
 {
-  description = "Reopen Claude Code sessions in tmux or cmux after a reboot";
+  description = "Reopen your Claude Code sessions in tmux or cmux after a reboot";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
   outputs = { self, nixpkgs }:
     let
-      systems = [ "x86_64-linux" "aarch64-linux" ];
+      systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
     in {
       packages = forAllSystems (system: rec {
