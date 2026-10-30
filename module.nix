@@ -6,11 +6,27 @@ in
   options.programs.claude-restore = {
     enable = lib.mkEnableOption "snapshot and restore of Claude Code sessions across reboots";
 
+    backend = lib.mkOption {
+      type = lib.types.enum [ "tmux" "cmux" ];
+      default = "tmux";
+      description = "Where sessions are reopened: one tmux session or one cmux workspace each.";
+    };
+
+    cmuxPackage = lib.mkOption {
+      type = lib.types.nullOr lib.types.package;
+      default = null;
+      description = "The cmux (cmux-tui) package, required when `backend = \"cmux\"`.";
+    };
+
     package = lib.mkOption {
       type = lib.types.package;
       # Same tmux as the user's, so the client speaks the running server's protocol.
-      default = pkgs.callPackage ./package.nix { tmux = config.programs.tmux.package; };
-      defaultText = lib.literalExpression "pkgs.callPackage ./package.nix { tmux = config.programs.tmux.package; }";
+      default = pkgs.callPackage ./package.nix {
+        inherit (cfg) backend;
+        tmux = config.programs.tmux.package;
+        cmux = cfg.cmuxPackage;
+      };
+      defaultText = lib.literalExpression "pkgs.callPackage ./package.nix { inherit (cfg) backend; tmux = config.programs.tmux.package; cmux = cfg.cmuxPackage; }";
       description = "The claude-restore package.";
     };
 
@@ -37,6 +53,9 @@ in
     assertions = [{
       assertion = pkgs.stdenv.hostPlatform.isLinux;
       message = "programs.claude-restore relies on /proc and systemd: Linux only.";
+    } {
+      assertion = cfg.backend == "cmux" -> cfg.cmuxPackage != null;
+      message = "programs.claude-restore.backend = \"cmux\" needs programs.claude-restore.cmuxPackage.";
     }];
 
     home.packages = [ cfg.package ];

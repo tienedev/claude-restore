@@ -1,5 +1,5 @@
 {
-  description = "Reopen Claude Code sessions in tmux after a reboot";
+  description = "Reopen Claude Code sessions in tmux or cmux after a reboot";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
